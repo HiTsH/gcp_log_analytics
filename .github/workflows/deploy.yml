@@ -1,0 +1,113 @@
+name: Deploy GCP Log Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  # Load from .env (via GitHub Secrets)
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GCP_REGION: ${{ secrets.GCP_REGION || 'europe-west1' }}
+  GCS_BUCKET_NAME: ${{ secrets.GCS_BUCKET_NAME }}
+  BQ_DATASET_ID: ${{ secrets.BQ_DATASET_ID || 'server_logs' }}
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Load environment variables
+        run: |
+          echo "GCP_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }}" >> $GITHUB_ENV
+          echo "GCP_REGION=${{ secrets.GCP_REGION || 'europe-west1' }}" >> $GITHUB_ENV
+          echo "GCS_BUCKET_NAME=${{ secrets.GCS_BUCKET_NAME }}" >> $GITHUB_ENV
+          echo "BQ_DATASET_ID=${{ secrets.BQ_DATASET_ID || 'server_logs' }}" >> $GITHUB_ENV
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install apache-beam[gcp] python-dotenv
+
+      - name: Configure GCP Credentials
+        run: |
+          echo "${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}" > gcp_credentials.json
+          echo "GOOGLE_APPLICATION_CREDENTIALS=gcp_credentials.json" >> $GITHUB_ENV
+
+  validate:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Terraform Init
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: "1.5.7"
+
+      - name: Terraform Validate
+        run: |
+          cd infra
+          terraform init -backend=false
+          terraform validate -var="project_id=$GCP_PROJECT_ID" \
+                            -var="region=$GCP_REGION" \
+                            -var="bucket_name=$GCS_BUCKET_NAME"
+
+  test:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Run Unit Tests
+        run: |
+          python -m pytest tests/ -v
+
+  deploy:
+    needs: [validate, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Deploy Infrastructure
+        run: |
+          cd infra
+          terraform init
+          terraform apply -auto-approve \
+            -var="project_id=$GCP_PROJECT_ID" \
+            -var="region=$GCP_REGION" \
+            -var="bucket_name=$GCS_BUCKET_NAME"
+
+      - name: Run Data Pipeline
+        run: |
+          python src/data_generator/generate_logs.py \
+            --output "gs://$GCS_BUCKET_NAME/logs/raw/" \
+            --records 1000000
+
+          python src/dataflow_pipeline/pipeline.py \
+            --input "gs://$GCS_BUCKET_NAME/logs/raw/*.csv" \
+            --output "$GCP_PROJECT_ID:$BQ_DATASET_ID.user_metrics"
+
+  # Future Slack Integration (commented out)
+  # notify:
+  #   needs: deploy
+  #   runs-on: ubuntu-latest
+  #   if: always()
+  #   steps:
+  #     - name: Notify Slack
+  #       uses: slackapi/slack-github-action@v1
+  #       with:
+  #         slack-message: |
+  #           ${{ job.status }}: Pipeline ${{ github.workflow }}
+  #           Details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  #       env:
+  #         SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

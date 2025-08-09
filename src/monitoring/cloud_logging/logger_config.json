@@ -1,0 +1,17 @@
+{
+  "loggers": {
+    "dataflow": {
+      "level": "INFO",
+      "handlers": ["cloud"],
+      "propagate": false
+    }
+  },
+  "handlers": {
+    "cloud": {
+      "class": "google.cloud.logging.handlers.CloudLoggingHandler",
+      "client": {
+        "project": "your-project"
+      }
+    }
+  }
+}
